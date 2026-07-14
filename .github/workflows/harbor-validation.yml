@@ -1,0 +1,87 @@
+name: Harbor validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install Harbor
+        run: |
+          uv tool install harbor==0.18.0
+          harbor --version
+          docker --version
+
+      - name: Run oracle
+        run: |
+          harbor run -p log-report -a oracle --jobs-dir jobs/oracle --job-name oracle -y | tee oracle-harbor.log
+
+      - name: Run no-op agent
+        run: |
+          harbor run -p log-report --agent nop --jobs-dir jobs/nop --job-name nop -y | tee nop-harbor.log
+
+      - name: Run deliberately bugged oracle
+        run: |
+          cp -R log-report /tmp/log-report-bugged
+          cat > /tmp/log-report-bugged/solution/solve.sh <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          cat > /app/report.json <<'JSON'
+          {"total_requests": 5, "unique_ips": 3, "top_path": "/index.html"}
+          JSON
+          SCRIPT
+          harbor run -p /tmp/log-report-bugged -a oracle --jobs-dir jobs/bugged --job-name bugged -y | tee bugged-harbor.log
+
+      - name: Verify rewards
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          from pathlib import Path
+
+          expected = {"oracle": 1.0, "nop": 0.0, "bugged": 0.0}
+
+          for run_name, expected_reward in expected.items():
+              candidates = []
+              for path in glob.glob(f"jobs/{run_name}/**/result.json", recursive=True):
+                  data = json.loads(Path(path).read_text())
+                  verifier = data.get("verifier_result")
+                  if verifier and verifier.get("rewards"):
+                      candidates.append((path, data))
+
+              if len(candidates) != 1:
+                  raise SystemExit(
+                      f"Expected one trial result for {run_name}, found {len(candidates)}"
+                  )
+
+              path, data = candidates[0]
+              reward = float(data["verifier_result"]["rewards"]["reward"])
+              print(f"{run_name}: reward={reward} result={path}")
+
+              if reward != expected_reward:
+                  raise SystemExit(
+                      f"{run_name}: expected reward {expected_reward}, got {reward}"
+                  )
+          PY
+
+      - name: Upload Harbor evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-validation-evidence
+          path: |
+            jobs/
+            *-harbor.log
+          if-no-files-found: warn
